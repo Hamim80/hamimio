@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -4453,19 +4454,36 @@ const SB = {
   url: localStorage.getItem('hamim_sb_url') || '',
   key: localStorage.getItem('hamim_sb_key') || '',
   user: localStorage.getItem('hamim_sb_user') || 'hamim',
+  // Auth-aware overrides (set after login)
+  _authUserId: null,
+  _authToken: null,
   autoInterval: null,
   log: JSON.parse(localStorage.getItem('hamim_sb_log') || '[]'),
 
   headers() {
+    // Prefer auth JWT token if available (user-scoped), else fall back to anon key
+    const token = this._authToken || this.key || SUPABASE_ANON_KEY;
+    const apikey = this.key || SUPABASE_ANON_KEY;
+    const baseUrl = this.url || SUPABASE_URL;
     return {
       'Content-Type': 'application/json',
-      'apikey': this.key,
-      'Authorization': 'Bearer ' + this.key,
+      'apikey': apikey,
+      'Authorization': 'Bearer ' + token,
       'Prefer': 'resolution=merge-duplicates'
     };
   },
 
-  ready() { return !!(this.url && this.key && this.user); },
+  // Effective user_id: prefer auth UUID, fallback to manual
+  userId() {
+    return this._authUserId || this.user || 'hamim';
+  },
+
+  // Effective base URL
+  baseUrl() {
+    return (this.url || SUPABASE_URL).replace(/\/$/, '');
+  },
+
+  ready() { return !!(this.baseUrl() && (this._authToken || this.key)); },
 
   addLog(msg) {
     this.log.unshift('[' + new Date().toLocaleTimeString('en-BD') + '] ' + msg);
@@ -4476,10 +4494,10 @@ const SB = {
 
   // upsert a single row: {user_id, key, value}
   async set(dataKey, value) {
-    const r = await fetch(this.url + '/rest/v1/hamim_data', {
+    const r = await fetch(this.baseUrl() + '/rest/v1/hamim_data', {
       method: 'POST',
       headers: this.headers(),
-      body: JSON.stringify({ user_id: this.user, data_key: dataKey, data_value: JSON.stringify(value), updated_at: new Date().toISOString() })
+      body: JSON.stringify({ user_id: this.userId(), data_key: dataKey, data_value: JSON.stringify(value), updated_at: new Date().toISOString() })
     });
     if(!r.ok) { const e = await r.text(); throw new Error(e); }
     return true;
@@ -4487,8 +4505,8 @@ const SB = {
 
   // get all rows for user
   async getAll() {
-    const r = await fetch(this.url + '/rest/v1/hamim_data?user_id=eq.' + encodeURIComponent(this.user) + '&select=data_key,data_value', {
-      headers: { 'apikey': this.key, 'Authorization': 'Bearer ' + this.key }
+    const r = await fetch(this.baseUrl() + '/rest/v1/hamim_data?user_id=eq.' + encodeURIComponent(this.userId()) + '&select=data_key,data_value', {
+      headers: { 'apikey': this.key || SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + (this._authToken || this.key || SUPABASE_ANON_KEY) }
     });
     if(!r.ok) throw new Error(await r.text());
     const rows = await r.json();
@@ -4501,8 +4519,8 @@ const SB = {
 
   // ping — try to read table
   async ping() {
-    const r = await fetch(this.url + '/rest/v1/hamim_data?limit=1', {
-      headers: { 'apikey': this.key, 'Authorization': 'Bearer ' + this.key }
+    const r = await fetch(this.baseUrl() + '/rest/v1/hamim_data?limit=1', {
+      headers: { 'apikey': this.key || SUPABASE_ANON_KEY, 'Authorization': 'Bearer ' + (this._authToken || this.key || SUPABASE_ANON_KEY) }
     });
     return r.ok;
   }
@@ -4711,10 +4729,23 @@ const _origSaveState = saveState;
 let _sbAutoDebounce = null;
 saveState = function(key) {
   _origSaveState(key);
-  // If auto-sync is on, debounce a cloud push after 3s of inactivity
-  if(localStorage.getItem('hamim_sb_auto') && SB.ready()) {
+  // Push to cloud if: (a) user is logged in via auth, OR (b) manual auto-sync is on
+  const isAuthLoggedIn = !!(SB._authUserId && SB._authToken);
+  const isManualAuto   = !!localStorage.getItem('hamim_sb_auto');
+  if (SB.ready() && (isAuthLoggedIn || isManualAuto)) {
     clearTimeout(_sbAutoDebounce);
-    _sbAutoDebounce = setTimeout(() => sbSyncNow(), 3000);
+    _sbAutoDebounce = setTimeout(() => {
+      // Only push the changed key for efficiency
+      const val = STATE[key];
+      if (val !== undefined) {
+        SB.set(key, val).then(() => {
+          const now = new Date().toLocaleTimeString('en-BD');
+          const el = document.getElementById('sb-last-sync');
+          if(el) el.textContent = now + ' · auto ✅';
+          localStorage.setItem('hamim_sb_last_sync', now + ' · auto ✅');
+        }).catch(e => console.warn('Auto-push error:', e));
+      }
+    }, 2000);
   }
 };
 
@@ -4772,7 +4803,14 @@ function switchAuthTab(tab) {
 }
 
 // ── Show / hide dashboard ───────────────────────────────────
-function showDashboard(user) {
+function showDashboard(user, session) {
+  // Inject auth credentials into SB so it uses user's JWT + UUID
+  SB._authUserId = user.id;
+  SB._authToken  = session ? session.access_token : null;
+  // Also pre-fill SB url/key from constants if not manually set
+  if (!SB.url) SB.url = SUPABASE_URL;
+  if (!SB.key) SB.key = SUPABASE_ANON_KEY;
+
   // Update sidebar user info
   const emailEl = document.getElementById('sidebar-user-email');
   const nameEl  = document.getElementById('sidebar-user-name');
@@ -4782,13 +4820,59 @@ function showDashboard(user) {
     const displayName = (meta && meta.full_name) ? meta.full_name : (user.email ? user.email.split('@')[0] : 'Hamim');
     nameEl.textContent = displayName.charAt(0).toUpperCase() + displayName.slice(1);
   }
+
   // Slide out auth overlay, show app
   const overlay = document.getElementById('auth-overlay');
   const shell   = document.getElementById('app-shell');
   if (overlay) { overlay.classList.add('hide'); setTimeout(() => { overlay.style.display = 'none'; }, 450); }
   if (shell)   shell.style.display = 'block';
-  // Run original dashboard init
+
+  // Run dashboard init first, then pull cloud data
   _dashboardInit();
+
+  // Auto-pull user data from Supabase after login
+  setTimeout(() => _autoRestoreFromCloud(), 800);
+}
+
+// ── Auto-restore all data from Supabase after login ────────
+async function _autoRestoreFromCloud() {
+  if (!SB.ready()) return;
+  try {
+    toast('☁️ Loading your cloud data...');
+    const data = await SB.getAll();
+    if (!Object.keys(data).length) {
+      SB.addLog('ℹ️ No cloud data found — fresh account or first time');
+      toast('✨ Dashboard ready! Data save করলে cloud এ যাবে।');
+      return;
+    }
+    const restorers = {
+      tasks:       () => { STATE.tasks = data.tasks; saveState('tasks'); renderTasks(); },
+      habits:      () => { STATE.habits = data.habits; saveState('habits'); renderHabits(); },
+      goals:       () => { STATE.goals = data.goals; saveState('goals'); renderGoals(); },
+      income:      () => { STATE.income = data.income; saveState('income'); renderBudget(); },
+      expenses:    () => { STATE.expenses = data.expenses; saveState('expenses'); renderBudget(); },
+      semesters:   () => { STATE.semesters = data.semesters; saveState('semesters'); buildSemesterInputs(); calcCGPA(); },
+      gre:         () => { STATE.gre = data.gre; saveState('gre'); loadGRE(); },
+      progress:    () => { STATE.progress = data.progress; saveState('progress'); },
+      note:        () => { STATE.note = data.note; saveState('note'); const n=document.getElementById('quick-note'); if(n) n.value=STATE.note; },
+      timetable:   () => { STATE.timetable = data.timetable; saveState('timetable'); renderTimetable(); },
+      customLinks: () => { STATE.customLinks = data.customLinks; saveState('customLinks'); renderCustomLinks(); },
+      courses:     () => { if(typeof courses !== 'undefined') { courses = data.courses; saveCourses(); renderCourses(); } },
+    };
+    let restored = 0;
+    for (const [k, fn] of Object.entries(restorers)) {
+      if (data[k] !== undefined) { try { fn(); restored++; } catch(e) { console.warn('restore error', k, e); } }
+    }
+    renderHomeDashboard();
+    SB.addLog('✅ Auto-restored ' + restored + ' datasets on login');
+    toast('✅ Cloud data loaded! (' + restored + ' sections synced)');
+    // Enable auto-sync after restore
+    if (localStorage.getItem('hamim_sb_auto')) sbStartAuto();
+  } catch(e) {
+    console.warn('Auto-restore error:', e);
+    SB.addLog('⚠️ Auto-restore failed: ' + e.message);
+    toast('⚠️ Cloud load failed: ' + e.message);
+  }
 }
 function showAuthScreen() {
   const overlay = document.getElementById('auth-overlay');
@@ -4810,13 +4894,13 @@ async function checkAuth() {
   try {
     const { data: { session } } = await sb.auth.getSession();
     if (session && session.user) {
-      showDashboard(session.user);
+      showDashboard(session.user, session);
     } else {
       showAuthScreen();
     }
     // Listen for auth state changes (tab switch, token refresh, etc.)
     sb.auth.onAuthStateChange((_event, session) => {
-      if (session && session.user) showDashboard(session.user);
+      if (session && session.user) showDashboard(session.user, session);
       else showAuthScreen();
     });
   } catch (e) {
@@ -4838,7 +4922,7 @@ async function signIn() {
     const { data, error } = await sb.auth.signInWithPassword({ email, password: pass });
     if (error) throw error;
     showAuthMsg('✅ Signed in successfully! Loading dashboard...', 'success');
-    setTimeout(() => showDashboard(data.user), 700);
+    setTimeout(() => showDashboard(data.user, data.session), 700);
   } catch (e) {
     const msg = e.message || 'Sign-in failed. Please try again.';
     showAuthMsg('❌ ' + (msg.includes('Invalid login') ? 'Wrong email or password. Please try again.' : msg), 'error');
@@ -4866,7 +4950,7 @@ async function signUp() {
     if (error) throw error;
     if (data.user && data.session) {
       showAuthMsg('🎉 Account created! Loading your dashboard...', 'success');
-      setTimeout(() => showDashboard(data.user), 800);
+      setTimeout(() => showDashboard(data.user, data.session), 800);
     } else {
       // Email confirmation required
       showAuthMsg('📧 Check your email to confirm your account, then sign in.', 'success');
